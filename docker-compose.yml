@@ -1,0 +1,150 @@
+# Manufacturing Data Chatbot — full stack.
+#
+#   cp .env.example .env && docker compose up --build
+#
+# Three long-running services (db, ollama, app) plus two one-shot helpers
+# (ollama-init pulls the model, seed populates the database). The one-shots
+# exit 0 and gate `app` via depends_on, so a fresh clone comes up in one command.
+
+name: mfg-chatbot
+
+x-app-build: &app-build
+  context: .
+  dockerfile: docker/app.Dockerfile
+
+services:
+  # ---------------------------------------------------------------- database
+  db:
+    image: postgres:16.4-alpine
+    container_name: mfg-db
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_ADMIN_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_ADMIN_PASSWORD}
+      # Consumed by db/init/01-create-readonly-role.sh on first bring-up only.
+      APP_READONLY_USER: ${APP_READONLY_USER}
+      APP_READONLY_PASSWORD: ${APP_READONLY_PASSWORD}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+    ports:
+      - "${DB_PORT_HOST:-5432}:5432"
+    healthcheck:
+      # $$ escapes the $ so compose passes it through to the shell in the container.
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 24
+      start_period: 10s
+    restart: unless-stopped
+
+  # ------------------------------------------------------------------ ollama
+  ollama:
+    image: ${OLLAMA_IMAGE:-ollama/ollama:0.9.0}
+    container_name: mfg-ollama
+    # Named volume => the model is downloaded ONCE and survives `down`/`up`.
+    volumes:
+      - ollama_models:/root/.ollama
+    ports:
+      - "${OLLAMA_PORT_HOST:-11434}:11434"
+    environment:
+      # Listen on all interfaces so the app container can reach it.
+      OLLAMA_HOST: 0.0.0.0:11434
+      # Keep the model resident between questions; on CPU, reloading is painful.
+      OLLAMA_KEEP_ALIVE: 24h
+    healthcheck:
+      # `ollama list` round-trips the HTTP API, so this proves the server is up,
+      # not merely that the process started.
+      test: ["CMD-SHELL", "ollama list > /dev/null 2>&1 || exit 1"]
+      interval: 5s
+      timeout: 10s
+      retries: 24
+      start_period: 10s
+    restart: unless-stopped
+
+    # ---- GPU (NVIDIA hosts only) -------------------------------------------
+    # CPU-only by default so this runs anywhere. To use an NVIDIA GPU:
+    #   1. install the NVIDIA Container Toolkit on the host
+    #   2. uncomment the block below
+    #   3. docker compose up -d --force-recreate ollama
+    # Verify with: docker compose exec ollama nvidia-smi
+    #
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+
+  # ------------------------------------------- one-shot: pull the model once
+  ollama-init:
+    image: ${OLLAMA_IMAGE:-ollama/ollama:0.9.0}
+    container_name: mfg-ollama-init
+    depends_on:
+      ollama:
+        condition: service_healthy
+    environment:
+      # The CLI here is a *client*: it tells the ollama SERVICE to download,
+      # so the bytes land in the ollama_models volume, not in this container.
+      OLLAMA_HOST: http://ollama:11434
+      OLLAMA_MODEL: ${OLLAMA_MODEL}
+    entrypoint: ["/bin/sh", "/init/pull-model.sh"]
+    volumes:
+      - ./docker/pull-model.sh:/init/pull-model.sh:ro
+    restart: "no"
+
+  # ------------------------------------- one-shot: create schema + seed data
+  seed:
+    build: *app-build
+    image: mfg-chatbot-app:latest
+    container_name: mfg-seed
+    depends_on:
+      db:
+        condition: service_healthy
+    env_file: .env
+    volumes:
+      - ./app:/srv/app
+    # Runs as the ADMIN role. Idempotent: no-ops when batches already has rows.
+    command: ["python", "seed_data.py"]
+    restart: "no"
+
+  # --------------------------------------------------------------- FastAPI app
+  app:
+    build: *app-build
+    image: mfg-chatbot-app:latest
+    container_name: mfg-app
+    depends_on:
+      db:
+        condition: service_healthy
+      seed:
+        condition: service_completed_successfully
+      ollama-init:
+        condition: service_completed_successfully
+    env_file: .env
+    environment:
+      # Belt and braces: these are already in .env, repeated here so the two
+      # classic gotchas are visible at the point of use.
+      OLLAMA_URL: ${OLLAMA_URL:-http://ollama:11434}
+      DB_HOST: ${DB_HOST:-db}
+    volumes:
+      # Bind mount + --reload: edit on the host, uvicorn restarts. No rebuild.
+      - ./app:/srv/app
+    ports:
+      - "${APP_PORT:-8000}:8000"
+    command:
+      ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+    healthcheck:
+      test:
+        ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health', timeout=5).status==200 else 1)\""]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 20s
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+    name: mfg_pgdata
+  ollama_models:
+    name: mfg_ollama_models

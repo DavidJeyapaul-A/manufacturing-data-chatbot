@@ -1,0 +1,165 @@
+# Semantic layer.
+#
+# Single source of truth for two things:
+#   1. sql_guard.py builds its table/column WHITELIST from this file. A column
+#      that is not listed here cannot be queried, by either path.
+#   2. llm_query.py renders this into the prompt so the model knows the schema
+#      in plain English.
+#
+# Add a column to the database => add it here, or the guard will reject it.
+
+database: mfg
+description: >-
+  Production data extracted from machine log files on a three-line
+  manufacturing plant. One row per batch, per part-count category, and per
+  alarm event. Read-only: this is a reporting copy, also consumed by Power BI.
+
+tables:
+
+  lines:
+    description: The physical production lines in the plant. Only three exist.
+    primary_key: line_id
+    columns:
+      line_id:
+        type: INT
+        description: Stable numeric id for the line. Join key for batches and alarms.
+      line_name:
+        type: TEXT
+        description: Human name of the line as operators refer to it.
+        values: ["Line A", "Line B", "Line C"]
+      location:
+        type: TEXT
+        description: Where the line physically sits, e.g. 'Building 1 - Bay 3'.
+
+  batches:
+    description: >-
+      One production run of a single product on a single line. A batch has a
+      target quantity and an actual output recorded in part_counts.
+    primary_key: batch_id
+    columns:
+      batch_id:
+        type: TEXT
+        description: Batch identifier, formatted 'B-YYYY-NNNNNN', e.g. 'B-2026-000123'.
+      line_id:
+        type: INT
+        description: The line this batch ran on. References lines.line_id.
+      product_code:
+        type: TEXT
+        description: Which product was made.
+        values: ["PRD-100", "PRD-101", "PRD-102", "PRD-103", "PRD-104", "PRD-105"]
+      start_time:
+        type: TIMESTAMP
+        description: >-
+          When the batch started. Use this for date filtering. Note that a small
+          number of batches start late in the evening and finish after midnight,
+          so start_time and end_time can fall on different calendar days.
+      end_time:
+        type: TIMESTAMP
+        description: When the batch finished. NULL means the batch is still running.
+      status:
+        type: TEXT
+        description: >-
+          Outcome of the batch. 'running' always has a NULL end_time.
+          'aborted' batches stopped early and produced less than target.
+        values: ["completed", "aborted", "running"]
+      target_quantity:
+        type: INT
+        description: How many parts the batch was scheduled to produce.
+
+  part_counts:
+    description: >-
+      Tidy/long format: exactly four rows per batch, one per category. To get a
+      batch total, SUM all four categories. To get good parts, filter
+      category = 'good'. Anything not 'good' is a reject / bad part.
+    primary_key: id
+    columns:
+      id:
+        type: INT
+        description: Surrogate key. Not meaningful — never group or report on it.
+      batch_id:
+        type: TEXT
+        description: The batch these parts belong to. References batches.batch_id.
+      category:
+        type: TEXT
+        description: >-
+          Which bucket the parts fell into. 'good' is sellable output; the three
+          'reject_*' categories are scrap, split by the reason it was rejected.
+        values: ["good", "reject_dimensional", "reject_visual", "reject_other"]
+      count:
+        type: INT
+        description: >-
+          Number of parts in this category for this batch. NOTE: 'count' is also
+          a SQL keyword, so quote it as "count" when selecting the column.
+
+  alarms:
+    description: >-
+      Machine alarm/stoppage events. An alarm may or may not belong to a batch:
+      batch_id is NULL for alarms that happened between batches. Downtime is
+      end_time - start_time; an alarm with a NULL end_time is still active.
+    primary_key: alarm_id
+    columns:
+      alarm_id:
+        type: INT
+        description: Surrogate key.
+      line_id:
+        type: INT
+        description: Line the alarm fired on. Always populated. References lines.line_id.
+      batch_id:
+        type: TEXT
+        description: >-
+          Batch that was running when the alarm fired, or NULL when no batch was
+          running. References batches.batch_id.
+      alarm_code:
+        type: TEXT
+        description: >-
+          The alarm identifier. Each code maps to exactly one description and one
+          severity, consistently across the whole table.
+        values:
+          ["ALM-01", "ALM-02", "ALM-03", "ALM-04", "ALM-05", "ALM-06",
+           "ALM-07", "ALM-08", "ALM-09", "ALM-10", "ALM-11", "ALM-12"]
+      description:
+        type: TEXT
+        description: Plain-English alarm text, e.g. 'Infeed conveyor jam'.
+      severity:
+        type: TEXT
+        description: How serious the alarm is. 'critical' stops the line.
+        values: ["info", "warning", "critical"]
+      start_time:
+        type: TIMESTAMP
+        description: When the alarm was raised. Use this for date filtering.
+      end_time:
+        type: TIMESTAMP
+        description: When the alarm cleared. NULL means the alarm is still active.
+
+# ---------------------------------------------------------------------------
+relationships:
+  - "batches.line_id -> lines.line_id"
+  - "part_counts.batch_id -> batches.batch_id"
+  - "alarms.line_id -> lines.line_id"
+  - "alarms.batch_id -> batches.batch_id (nullable)"
+
+# Domain rules worth stating to the model in the prompt.
+business_rules:
+  - "Good parts = part_counts where category = 'good'."
+  - "Bad parts / rejects / scrap = part_counts where category <> 'good' (the three reject_* categories)."
+  - "Total parts produced by a batch = SUM of all four part_counts rows for that batch."
+  - "Yield % = 100.0 * good parts / total parts."
+  - "Alarm downtime in seconds = end_time - start_time; ignore or treat as ongoing when end_time IS NULL."
+  - "Filter batches by start_time and alarms by start_time unless the question clearly means completion."
+  - "A line is identified by lines.line_name ('Line A', 'Line B', 'Line C'); join through lines.line_id."
+  - "Never divide by SUM(count) without guarding against zero; use NULLIF."
+
+# Reference data (also enforced by the seeder, so it is always true).
+alarm_catalogue:
+  ALM-01: {description: "Infeed conveyor jam",        severity: warning}
+  ALM-02: {description: "Emergency stop pressed",     severity: critical}
+  ALM-03: {description: "Low air pressure",           severity: warning}
+  ALM-04: {description: "Vision system fault",        severity: warning}
+  ALM-05: {description: "Labeller misfeed",           severity: warning}
+  ALM-06: {description: "Guard door open",            severity: critical}
+  ALM-07: {description: "Temperature out of range",   severity: warning}
+  ALM-08: {description: "Reject bin full",            severity: info}
+  ALM-09: {description: "Product changeover",         severity: info}
+  ALM-10: {description: "Motor overload",             severity: critical}
+  ALM-11: {description: "Sensor communication lost",  severity: warning}
+  ALM-12: {description: "Scheduled maintenance",      severity: info}

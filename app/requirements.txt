@@ -1,0 +1,11 @@
+# Pinned for reproducibility across machines.
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+psycopg[binary]==3.2.3
+sqlglot==26.0.0
+PyYAML==6.0.2
+httpx==0.28.1
+
+# Dev only — kept in the image so the test suite runs in the container with
+# `docker compose run --rm --no-deps app python -m pytest tests/ -q`.
+pytest==8.3.4

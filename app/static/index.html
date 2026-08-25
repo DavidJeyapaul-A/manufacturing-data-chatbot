@@ -1,0 +1,292 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Manufacturing Data Chatbot</title>
+<!--
+  Vanilla HTML/CSS/JS. No build step, no CDN, no external font: the target
+  environment has no internet access at runtime, so a page that reaches out for
+  a stylesheet would render broken on the client's network.
+-->
+<style>
+  :root {
+    --bg: #0f1419; --panel: #171d24; --panel-2: #1e252e; --line: #2a333d;
+    --text: #e6edf3; --muted: #8b98a5; --accent: #4c9aff; --accent-dim: #2b5c99;
+    --ok: #3fb950; --warn: #d29922; --bad: #f85149; --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 15px/1.55 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    display: flex; flex-direction: column; height: 100vh;
+  }
+  header {
+    padding: 14px 20px; border-bottom: 1px solid var(--line); background: var(--panel);
+    display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap;
+  }
+  header h1 { font-size: 17px; margin: 0; font-weight: 600; }
+  header .sub { color: var(--muted); font-size: 13px; }
+  #status { margin-left: auto; font-size: 12.5px; color: var(--muted); }
+  #status .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+                 background: var(--muted); margin-right: 6px; vertical-align: middle; }
+  #status.ready .dot { background: var(--ok); }
+  #status.warming .dot { background: var(--warn); }
+  #status.failed .dot { background: var(--bad); }
+
+  #banner { display: none; padding: 10px 20px; background: #2b2410; color: #f0d58c;
+            border-bottom: 1px solid var(--line); font-size: 13.5px; }
+  #banner.show { display: block; }
+  #banner.error { background: #2d1618; color: #ffb3ae; }
+
+  main { flex: 1; overflow-y: auto; padding: 20px; }
+  .wrap { max-width: 860px; margin: 0 auto; }
+
+  .chips { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 18px; }
+  .chip { background: var(--panel-2); border: 1px solid var(--line); color: var(--muted);
+          padding: 6px 11px; border-radius: 14px; font-size: 12.5px; cursor: pointer; }
+  .chip:hover { border-color: var(--accent-dim); color: var(--text); }
+
+  .msg { margin-bottom: 16px; }
+  .msg.user .bubble {
+    background: var(--accent-dim); color: #fff; margin-left: auto;
+    max-width: 78%; padding: 9px 13px; border-radius: 12px 12px 3px 12px;
+  }
+  .msg.bot .bubble {
+    background: var(--panel); border: 1px solid var(--line);
+    max-width: 92%; padding: 11px 14px; border-radius: 12px 12px 12px 3px;
+  }
+  .msg.bot.error .bubble { border-color: #5c2b2b; }
+  .bubble { width: fit-content; }
+
+  .meta { margin-top: 9px; display: flex; gap: 8px; flex-wrap: wrap; align-items: center;
+          font-size: 11.5px; color: var(--muted); }
+  .tag { border: 1px solid var(--line); border-radius: 4px; padding: 1px 7px;
+         background: var(--panel-2); font-family: var(--mono); }
+  .tag.template { color: var(--ok); border-color: #24512c; }
+  .tag.llm { color: var(--accent); border-color: var(--accent-dim); }
+  .tag.rejected, .tag.error, .tag.not_ready { color: var(--bad); border-color: #5c2b2b; }
+
+  details { margin-top: 9px; border: 1px solid var(--line); border-radius: 6px;
+            background: var(--panel-2); }
+  summary { cursor: pointer; padding: 7px 11px; font-size: 12.5px; color: var(--muted);
+            user-select: none; }
+  summary:hover { color: var(--text); }
+  details[open] summary { border-bottom: 1px solid var(--line); }
+  .details-body { padding: 11px; }
+  pre.sql { margin: 0 0 10px; padding: 10px; background: #0c1116; border: 1px solid var(--line);
+            border-radius: 5px; font-family: var(--mono); font-size: 12.5px;
+            overflow-x: auto; white-space: pre; color: #b8d4f0; }
+  .stats { display: flex; gap: 16px; flex-wrap: wrap; font-size: 12px; color: var(--muted);
+           font-family: var(--mono); }
+  .params { font-size: 12px; color: var(--muted); font-family: var(--mono); margin-bottom: 9px; }
+  .param { display: inline-block; background: #0c1116; border: 1px solid var(--line);
+           border-radius: 4px; padding: 1px 7px; margin: 2px 2px 0 0; color: #b8d4f0; }
+  .stats b { color: var(--text); font-weight: 600; }
+
+  .table-scroll { overflow-x: auto; margin-top: 10px; max-height: 320px; overflow-y: auto; }
+  table { border-collapse: collapse; font-size: 12.5px; width: 100%; }
+  th, td { border: 1px solid var(--line); padding: 4px 9px; text-align: left; white-space: nowrap; }
+  th { background: #0c1116; position: sticky; top: 0; color: var(--muted); font-weight: 600; }
+  td.num { text-align: right; font-family: var(--mono); }
+
+  footer { border-top: 1px solid var(--line); background: var(--panel); padding: 13px 20px; }
+  form { max-width: 860px; margin: 0 auto; display: flex; gap: 9px; }
+  input[type=text] {
+    flex: 1; background: var(--bg); border: 1px solid var(--line); color: var(--text);
+    padding: 10px 13px; border-radius: 7px; font-size: 14.5px; font-family: inherit;
+  }
+  input[type=text]:focus { outline: none; border-color: var(--accent-dim); }
+  button { background: var(--accent); color: #06121f; border: 0; padding: 10px 20px;
+           border-radius: 7px; font-size: 14.5px; font-weight: 600; cursor: pointer; }
+  button:disabled { background: var(--line); color: var(--muted); cursor: not-allowed; }
+  .thinking::after { content: ""; animation: dots 1.2s steps(4, end) infinite; }
+  @keyframes dots { 0% { content: ""; } 25% { content: "."; } 50% { content: ".."; } 75% { content: "..."; } }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Manufacturing Data Chatbot</h1>
+  <span class="sub">Local LLM · no cloud AI</span>
+  <span id="status" class="warming"><span class="dot"></span><span id="status-text">checking…</span></span>
+</header>
+
+<div id="banner"></div>
+
+<main>
+  <div class="wrap">
+    <div class="chips" id="chips"></div>
+    <div id="chat"></div>
+  </div>
+</main>
+
+<footer>
+  <form id="form" autocomplete="off">
+    <input type="text" id="q" placeholder="Ask about production, batches, parts or alarms…" maxlength="500" required>
+    <button type="submit" id="send">Ask</button>
+  </form>
+</footer>
+
+<script>
+const chat = document.getElementById('chat');
+const form = document.getElementById('form');
+const input = document.getElementById('q');
+const send = document.getElementById('send');
+const banner = document.getElementById('banner');
+const statusEl = document.getElementById('status');
+const statusText = document.getElementById('status-text');
+
+const esc = (s) => String(s ?? '').replace(/[&<>"']/g, c => (
+  { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
+// ---- readiness banner ----------------------------------------------------
+// /health reports which of the two checks (database, model) is outstanding, so
+// a slow first model load reads as "warming up", not as a broken app.
+async function poll() {
+  try {
+    const r = await fetch('/health');
+    const h = await r.json();
+    if (h.ready) {
+      statusEl.className = 'ready';
+      statusText.textContent = `ready · ${h.model}`;
+      banner.className = '';
+      return true;
+    }
+    const pending = Object.entries(h.checks || {})
+      .filter(([, c]) => !c.ready).map(([n, c]) => `${n}: ${c.message}`).join(' · ');
+    if (h.state === 'failed') {
+      statusEl.className = 'failed';
+      statusText.textContent = 'failed';
+      banner.className = 'show error';
+      banner.textContent = 'Startup failed. ' + pending + ' — check `docker compose logs`.';
+    } else {
+      statusEl.className = 'warming';
+      statusText.textContent = 'warming up';
+      banner.className = 'show';
+      banner.textContent = 'Warming up — ' + pending +
+        '. The first model load on CPU can take a minute or two.';
+    }
+  } catch {
+    statusEl.className = 'failed';
+    statusText.textContent = 'unreachable';
+  }
+  return false;
+}
+poll();
+const timer = setInterval(async () => { if (await poll()) clearInterval(timer); }, 3000);
+
+// ---- suggestion chips ----------------------------------------------------
+fetch('/examples').then(r => r.json()).then(d => {
+  document.getElementById('chips').innerHTML =
+    (d.questions || []).map(q => `<span class="chip">${esc(q)}</span>`).join('');
+}).catch(() => {});
+
+document.getElementById('chips').addEventListener('click', e => {
+  if (e.target.classList.contains('chip')) {
+    input.value = e.target.textContent;
+    form.requestSubmit();
+  }
+});
+
+// ---- chat ----------------------------------------------------------------
+function addUser(text) {
+  chat.insertAdjacentHTML('beforeend',
+    `<div class="msg user"><div class="bubble">${esc(text)}</div></div>`);
+  scroll();
+}
+
+function addPending() {
+  const el = document.createElement('div');
+  el.className = 'msg bot';
+  el.innerHTML = `<div class="bubble"><span class="thinking">Thinking</span></div>`;
+  chat.appendChild(el);
+  scroll();
+  return el;
+}
+
+function table(cols, rows) {
+  if (!cols || !cols.length || !rows || !rows.length) return '';
+  const isNum = v => v !== null && v !== '' && !isNaN(v);
+  const head = cols.map(c => `<th>${esc(c)}</th>`).join('');
+  const body = rows.map(r => '<tr>' + r.map(v =>
+    `<td class="${isNum(v) ? 'num' : ''}">${v === null ? '<i>null</i>' : esc(v)}</td>`
+  ).join('') + '</tr>').join('');
+  return `<div class="table-scroll"><table><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table></div>`;
+}
+
+// The expandable panel is the core of the demo: the generated SQL, how long it
+// took, and how many rows came back — always available, never hidden away.
+function details(a) {
+  if (!a.sql && !a.detail) return '';
+  const stats = [
+    a.execution_ms ? `query <b>${a.execution_ms} ms</b>` : null,
+    a.llm_ms ? `model <b>${Math.round(a.llm_ms)} ms</b>` : null,
+    a.total_ms ? `total <b>${Math.round(a.total_ms)} ms</b>` : null,
+    `rows <b>${a.row_count ?? 0}</b>`,
+    a.truncated ? `<b>row cap hit</b>` : null,
+    (a.notes && a.notes.length) ? esc(a.notes.join('; ')) : null,
+  ].filter(Boolean).join('');
+  return `<details>
+    <summary>Show SQL, timing and rows</summary>
+    <div class="details-body">
+      ${a.sql ? `<pre class="sql">${esc(a.sql)}</pre>` : ''}
+      ${(a.params && a.params.length) ? `<div class="params">bound parameters:
+        ${a.params.map(v => `<span class="param">${esc(v)}</span>`).join(' ')}</div>` : ''}
+      <div class="stats">${stats}</div>
+      ${a.detail ? `<div class="stats" style="margin-top:8px">${esc(a.detail)}</div>` : ''}
+      ${table(a.columns, a.rows)}
+    </div>
+  </details>`;
+}
+
+function render(el, a) {
+  const route = a.route || 'error';
+  const label = { template: 'template · no LLM', llm: `LLM · ${a.model || 'local model'}`,
+                  rejected: 'rejected by SQL guard', error: 'error',
+                  not_ready: 'not ready' }[route] || route;
+  el.className = 'msg bot' + (a.ok ? '' : ' error');
+  el.innerHTML = `<div class="bubble">
+      <div>${esc(a.answer)}</div>
+      <div class="meta">
+        <span class="tag ${esc(route)}">${esc(label)}</span>
+        ${a.template_id ? `<span class="tag">${esc(a.template_id)}</span>` : ''}
+      </div>
+      ${details(a)}
+    </div>`;
+  scroll();
+}
+
+function scroll() {
+  const m = document.querySelector('main');
+  m.scrollTop = m.scrollHeight;
+}
+
+form.addEventListener('submit', async e => {
+  e.preventDefault();
+  const question = input.value.trim();
+  if (!question) return;
+  addUser(question);
+  input.value = '';
+  send.disabled = true;
+  const pending = addPending();
+  try {
+    const r = await fetch('/ask', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ question }),
+    });
+    render(pending, await r.json());
+  } catch (err) {
+    render(pending, { ok: false, route: 'error',
+      answer: 'Could not reach the backend.', detail: String(err) });
+  } finally {
+    send.disabled = false;
+    input.focus();
+  }
+});
+
+input.focus();
+</script>
+</body>
+</html>

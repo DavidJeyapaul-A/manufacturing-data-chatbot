@@ -1,0 +1,153 @@
+# Few-shot examples for the LLM fallback path — PostgreSQL dialect.
+#
+# ONE file per dialect, deliberately: migrating to SQL Server means copying this
+# to tsql.yaml and adjusting the SQL, with no code change anywhere else
+# (db/dialect.py already points at the right filename).
+#
+# These examples are chosen to teach the model the things it gets WRONG without
+# help, and to cover ground the templates deliberately do not:
+#   * part_counts is tidy/long — four rows per batch, so totals need SUM
+#   * "count" is a reserved word and must be quoted as "count"
+#   * good vs reject is a category filter, not a column
+#   * alarms.batch_id is nullable — that is a real question, not a data error
+#   * durations are EXTRACT(EPOCH FROM ...) on Postgres
+#
+# Every example below is validated against sql_guard by tests/test_fewshot.py,
+# so a bad example fails the test suite rather than the demo.
+
+examples:
+
+  - question: Which product had the worst reject rate last month?
+    sql: |
+      SELECT b.product_code,
+             SUM(pc."count") AS total_parts,
+             SUM(CASE WHEN pc.category <> 'good' THEN pc."count" ELSE 0 END) AS reject_parts,
+             ROUND(100.0 * SUM(CASE WHEN pc.category <> 'good' THEN pc."count" ELSE 0 END)
+                   / NULLIF(SUM(pc."count"), 0), 2) AS reject_pct
+      FROM part_counts pc
+      JOIN batches b ON b.batch_id = pc.batch_id
+      WHERE b.start_time >= DATE_TRUNC('month', CURRENT_DATE) - INTERVAL '1 month'
+        AND b.start_time <  DATE_TRUNC('month', CURRENT_DATE)
+      GROUP BY b.product_code
+      ORDER BY reject_pct DESC
+
+  - question: How many alarms fired when no batch was running?
+    sql: |
+      SELECT l.line_name,
+             COUNT(*) AS standalone_alarms
+      FROM alarms a
+      JOIN lines l ON l.line_id = a.line_id
+      WHERE a.batch_id IS NULL
+        AND a.start_time >= CURRENT_DATE - INTERVAL '30 days'
+      GROUP BY l.line_name
+      ORDER BY standalone_alarms DESC
+
+  - question: What is the average batch duration in hours for each line?
+    sql: |
+      SELECT l.line_name,
+             COUNT(*) AS completed_batches,
+             ROUND(AVG(EXTRACT(EPOCH FROM (b.end_time - b.start_time))) / 3600.0, 2) AS avg_hours
+      FROM batches b
+      JOIN lines l ON l.line_id = b.line_id
+      WHERE b.end_time IS NOT NULL
+        AND b.start_time >= CURRENT_DATE - INTERVAL '30 days'
+      GROUP BY l.line_name
+      ORDER BY avg_hours DESC
+
+  - question: Show me the 5 longest alarms in the last 7 days.
+    sql: |
+      SELECT a.alarm_code,
+             a.description,
+             a.severity,
+             l.line_name,
+             a.start_time,
+             ROUND(EXTRACT(EPOCH FROM (a.end_time - a.start_time)) / 60.0, 1) AS minutes
+      FROM alarms a
+      JOIN lines l ON l.line_id = a.line_id
+      WHERE a.end_time IS NOT NULL
+        AND a.start_time >= CURRENT_DATE - INTERVAL '7 days'
+      ORDER BY minutes DESC
+      LIMIT 5
+
+  - question: Which batches ran overnight, starting one day and finishing the next?
+    sql: |
+      SELECT b.batch_id,
+             l.line_name,
+             b.start_time,
+             b.end_time
+      FROM batches b
+      JOIN lines l ON l.line_id = b.line_id
+      WHERE b.end_time IS NOT NULL
+        AND DATE_TRUNC('day', b.end_time) > DATE_TRUNC('day', b.start_time)
+        AND b.start_time >= CURRENT_DATE - INTERVAL '60 days'
+      ORDER BY b.start_time DESC
+
+  - question: How many critical alarms did each line have this month?
+    sql: |
+      SELECT l.line_name,
+             COUNT(*) AS critical_alarms
+      FROM alarms a
+      JOIN lines l ON l.line_id = a.line_id
+      WHERE a.severity = 'critical'
+        AND a.start_time >= DATE_TRUNC('month', CURRENT_DATE)
+      GROUP BY l.line_name
+      ORDER BY critical_alarms DESC
+
+  - question: What was the total good output per product code in July 2026?
+    sql: |
+      SELECT b.product_code,
+             SUM(pc."count") AS good_parts
+      FROM part_counts pc
+      JOIN batches b ON b.batch_id = pc.batch_id
+      WHERE pc.category = 'good'
+        AND b.start_time >= '2026-07-01'
+        AND b.start_time <  '2026-08-01'
+      GROUP BY b.product_code
+      ORDER BY good_parts DESC
+
+  - question: Which batches last week had no alarms at all?
+    sql: |
+      SELECT b.batch_id,
+             l.line_name,
+             b.product_code,
+             b.start_time
+      FROM batches b
+      JOIN lines l ON l.line_id = b.line_id
+      WHERE b.start_time >= CURRENT_DATE - INTERVAL '7 days'
+        AND NOT EXISTS (
+          SELECT 1
+          FROM alarms a
+          WHERE a.batch_id = b.batch_id
+        )
+      ORDER BY b.start_time DESC
+
+  - question: How does each line's yield compare against its target quantity?
+    sql: |
+      SELECT l.line_name,
+             SUM(b.target_quantity) AS target_parts,
+             SUM(t.total_parts) AS actual_parts,
+             ROUND(100.0 * SUM(t.total_parts) / NULLIF(SUM(b.target_quantity), 0), 2) AS attainment_pct
+      FROM batches b
+      JOIN lines l ON l.line_id = b.line_id
+      JOIN (
+        SELECT pc.batch_id, SUM(pc."count") AS total_parts
+        FROM part_counts pc
+        GROUP BY pc.batch_id
+      ) t ON t.batch_id = b.batch_id
+      WHERE b.status = 'completed'
+        AND b.start_time >= CURRENT_DATE - INTERVAL '30 days'
+      GROUP BY l.line_name
+      ORDER BY attainment_pct DESC
+
+  - question: Which alarm code causes the most downtime per occurrence?
+    sql: |
+      SELECT a.alarm_code,
+             a.description,
+             COUNT(*) AS occurrences,
+             ROUND(AVG(EXTRACT(EPOCH FROM (a.end_time - a.start_time))) / 60.0, 1) AS avg_minutes
+      FROM alarms a
+      WHERE a.end_time IS NOT NULL
+        AND a.start_time >= CURRENT_DATE - INTERVAL '30 days'
+      GROUP BY a.alarm_code, a.description
+      HAVING COUNT(*) >= 3
+      ORDER BY avg_minutes DESC
