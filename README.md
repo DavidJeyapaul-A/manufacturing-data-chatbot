@@ -57,7 +57,9 @@ See [example_questions.md](example_questions.md) for a full demo script.
 ```bash
 docker compose up -d               # start in the background
 docker compose down                # stop, KEEP data and model
-docker compose down -v             # stop and WIPE the database + the model
+docker compose down -v             # stop and WIPE EVERYTHING — including the
+                                   # model volume, forcing a ~4.7 GB re-download
+docker compose down && docker volume rm mfg_pgdata   # reset ONLY the database
 docker compose logs -f app         # follow the app
 docker compose restart app         # after changing something uvicorn missed
 docker compose ps                  # what is healthy
@@ -99,7 +101,8 @@ gotcha. A one-shot `ollama-init` service handles it:
 Because the volume is named and persistent, **the download happens exactly once,
 ever**. Every later `docker compose up` finds the model already present and
 `ollama-init` exits in under a second. `docker compose down -v` is the only
-thing that discards it.
+thing that discards it — which is exactly why `-v` is the wrong way to reset the
+database. Remove `mfg_pgdata` by name instead.
 
 To use a different model:
 
@@ -237,8 +240,13 @@ rewritten into something that probably meant the same thing.
 | `mfg_admin` | the one-shot `seed` service, and nothing else | owner |
 | `readonly_user` | **every chatbot query** | `CONNECT`, `USAGE`, `SELECT` |
 
-`db/init/01-create-readonly-role.sh` creates the role on first bring-up;
-`seed_data.py` creates the tables and grants `SELECT` on them. The query path
+`db/init/01-create-readonly-role.sh` creates the role on first bring-up.
+Because Postgres runs init scripts **only against an empty data volume**, that
+script never runs on a volume that already exists — so `seed_data.py` also
+creates the role if it is missing, and re-applies its password from `.env`,
+every time it runs. That makes a stale volume self-healing and means a password
+change no longer requires `down -v`. `seed_data.py` then creates the tables and
+grants `SELECT` on them. The query path
 opens `READONLY_DATABASE_URL` and no other connection, so the chatbot is
 *physically* incapable of writing — the guard is the friendly error message, the
 role is the actual guarantee. Belt and braces: the session is also set
@@ -268,10 +276,11 @@ By default the 60-day window ends **today**, so "yesterday" and "last week"
 always have data. Set `SEED_END_DATE=2026-08-24` in `.env` to pin the calendar
 too and get byte-identical rows.
 
-Re-seed from scratch:
+Re-seed from scratch (database only — the model volume is left alone):
 
 ```bash
-docker compose down -v
+docker compose down
+docker volume rm mfg_pgdata
 docker compose up -d
 ```
 
@@ -376,18 +385,19 @@ All of `.env`, with the ones that matter most:
 | `OLLAMA_URL` | `http://ollama:11434` | **Service name, not localhost** — inside the app container `localhost` is the app itself. |
 | `OLLAMA_MODEL` | `qwen2.5-coder:7b` | Pulled once into the named volume. |
 | `OLLAMA_TIMEOUT` | `180` | Seconds. CPU inference is slow; lower it for a GPU or a small model. |
-| `ADMIN_DATABASE_URL` | — | Seed step only. |
-| `READONLY_DATABASE_URL` | — | Every chatbot query. |
+| `POSTGRES_ADMIN_USER` / `_PASSWORD` | `mfg_admin` | Seed step only. The DSN is built from these. |
+| `APP_READONLY_USER` / `_PASSWORD` | `readonly_user` | Every chatbot query. The DSN is built from these. |
+| `ADMIN_DATABASE_URL` / `READONLY_DATABASE_URL` | *(unset)* | Optional override, for a database this compose file did not create. Must agree with the variables above or the app refuses to start. |
 | `MAX_ROWS` | `200` | Hard row cap; the guard injects or clamps `LIMIT`. |
 | `STATEMENT_TIMEOUT_MS` | `8000` | Server-side kill switch for a runaway query. |
 | `SEED_RANDOM_SEED` | `20260101` | Same data on every machine. |
 | `SEED_END_DATE` | *(blank)* | Blank anchors the window to today. Set it to pin the calendar. |
 | `DB_DIALECT` | `postgres` | See section 8. |
 
-Passwords in `.env.example` are placeholders and fine for a local POC. The
-readonly role is created **only on first bring-up** (Postgres runs `db/init/`
-against an empty volume only), so changing its password later needs either
-`docker compose down -v` or a manual `ALTER ROLE`.
+Passwords in `.env.example` are placeholders and fine for a local POC. Changing
+the readonly password just means editing `.env` and running `docker compose up`:
+`db/init/` only runs against an empty volume, so the seed step re-applies the
+role's password on every bring-up.
 
 ---
 
@@ -415,7 +425,41 @@ auto-repaired.
 in `.env`.
 
 **The seed ran but there is no data.** It is idempotent — it skips when
-`batches` is non-empty. Force a rebuild with `docker compose down -v && docker compose up`.
+`batches` is non-empty. Force a rebuild with
+`docker compose down && docker volume rm mfg_pgdata && docker compose up`.
+
+**`password authentication failed for user "readonly_user"`.** Note that
+Postgres returns this same message when the role **does not exist at all** — it
+deliberately does not reveal which usernames are valid. So treat it as "the role
+is missing or its password is stale", not as proof the role exists.
+
+The seed step re-creates the role and re-applies its password from `.env` on
+every bring-up, so this normally fixes itself:
+
+```bash
+docker compose up          # the seed repairs the role
+```
+
+If it persists, the log line to look for is in the `db` output:
+
+```
+PostgreSQL Database directory appears to contain a database; Skipping initialization
+```
+
+That means the data volume predates the current `db/init/` script. The seed
+repairs the role anyway, but to start genuinely clean:
+
+```bash
+docker compose down
+docker volume rm mfg_pgdata
+docker compose up
+```
+
+**Do not reach for `docker compose down -v` here.** `-v` removes *every* named
+volume in the compose file — including `mfg_ollama_models`, which costs you the
+whole ~4.7 GB model download again. Removing `mfg_pgdata` by name resets the
+database and leaves the model alone. The seed data is regenerated identically
+from the fixed RNG seed.
 
 ---
 

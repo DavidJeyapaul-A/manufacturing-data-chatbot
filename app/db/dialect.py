@@ -123,6 +123,17 @@ class Dialect(ABC):
     def grant_readonly_statements(self, readonly_user: str, tables: list[str]) -> list[str]:
         """GRANT SELECT on the seeded tables to the readonly role."""
 
+    @abstractmethod
+    def ensure_readonly_role(self, conn: Any, user: str, password: str, db_name: str) -> bool:
+        """Create the SELECT-only role if missing; re-apply its password if not.
+
+        The db init script creates this role, but Postgres runs init scripts ONLY
+        against an empty data volume — so on a volume that already existed, the
+        role is never created and never repaired. The seed step runs on every
+        bring-up with admin rights, which makes it the right place to guarantee
+        the role matches .env. Returns True if the role already existed.
+        """
+
 
 def _literal_int(node: Any) -> int | None:
     """Best-effort read of an integer out of a sqlglot literal node."""
@@ -219,6 +230,33 @@ class PostgresDialect(Dialect):
             "CREATE INDEX IF NOT EXISTS ix_alarms_batch ON alarms (batch_id)",
         ]
 
+    def ensure_readonly_role(self, conn: Any, user: str, password: str, db_name: str) -> bool:
+        from psycopg import sql
+
+        role = sql.Identifier(user)
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM pg_roles WHERE rolname = %s", (user,))
+            exists = cur.fetchone() is not None
+
+            # ALTER when it exists re-syncs the password with .env, so changing
+            # a password no longer requires recreating the volume.
+            verb = sql.SQL("ALTER ROLE") if exists else sql.SQL("CREATE ROLE")
+            cur.execute(
+                sql.SQL("{verb} {role} LOGIN NOINHERIT PASSWORD {password}").format(
+                    verb=verb, role=role, password=sql.Literal(password)
+                )
+            )
+            # Identifiers cannot be bound as parameters, so they are composed
+            # with sql.Identifier — which quotes and escapes them properly.
+            cur.execute(
+                sql.SQL("GRANT CONNECT ON DATABASE {db} TO {role}").format(
+                    db=sql.Identifier(db_name), role=role
+                )
+            )
+            cur.execute(sql.SQL("GRANT USAGE ON SCHEMA public TO {role}").format(role=role))
+            cur.execute(sql.SQL("REVOKE CREATE ON SCHEMA public FROM {role}").format(role=role))
+        return exists
+
     def grant_readonly_statements(self, readonly_user: str, tables: list[str]) -> list[str]:
         user = self.quote_identifier(readonly_user)
         stmts = [f"GRANT USAGE ON SCHEMA public TO {user}"]
@@ -271,6 +309,14 @@ class SqlServerDialect(Dialect):
             "SQL Server DDL differs: TEXT -> NVARCHAR(MAX), SERIAL -> INT IDENTITY(1,1), "
             "TIMESTAMP -> DATETIME2. In production the tables already exist, so the seed "
             "step is Postgres/POC-only anyway."
+        )
+
+    def ensure_readonly_role(self, conn: Any, user: str, password: str, db_name: str) -> bool:
+        # On SQL Server the login is created by a DBA, not by this application —
+        # it will not have permission to CREATE LOGIN in the client's estate.
+        raise NotImplementedError(
+            "On SQL Server, ask the DBA to create the login and add it to "
+            "db_datareader. See the README, 'Migrating to SQL Server'."
         )
 
     def grant_readonly_statements(self, readonly_user: str, tables: list[str]) -> list[str]:

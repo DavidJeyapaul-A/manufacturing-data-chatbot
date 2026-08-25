@@ -48,8 +48,10 @@ def _label(context: dict[str, Any]) -> str:
     bits = []
     if context.get("line"):
         bits.append(f"on {context['line']}")
-    if context.get("period"):
-        bits.append(f"over {context['period']}")
+    period = context.get("period")
+    if period:
+        # 'right now' is already a complete phrase; "over right now" is not.
+        bits.append(period if period.startswith("right now") else f"over {period}")
     return (" " + " ".join(bits)) if bits else ""
 
 
@@ -250,7 +252,9 @@ def _say_generic(result: QueryResult) -> str:
         return f"One row: {pairs}."
 
     lead = rows[0]
-    lead_text = ", ".join(f"{_readable(c)} {_fmt(lead[c])}" for c in result.columns[:3])
+    # Enough columns to include the one the query ordered by — on the LLM path
+    # that is usually the column the question was actually about.
+    lead_text = ", ".join(f"{_readable(c)} {_fmt(lead[c])}" for c in result.columns[:4])
     suffix = " (capped at the row limit)" if result.truncated else ""
     return (
         f"{_fmt(result.row_count)} rows{suffix}. The first is {lead_text}. "

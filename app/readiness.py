@@ -44,7 +44,24 @@ class Readiness:
     database: Check = field(default_factory=lambda: Check("database"))
     model: Check = field(default_factory=lambda: Check("model"))
     state: str = "starting"          # starting | ready | failed
+    #: Set when the prompt-cache warm-up STARTS, and again when it FINISHES.
+    #: The LLM path waits only while a warm-up is genuinely in flight — waiting
+    #: on one that was never started (a bare process, a dead prober) would block
+    #: every question for the full timeout instead of merely being slow.
+    llm_warm_started: threading.Event = field(default_factory=threading.Event, repr=False)
+    llm_warm: threading.Event = field(default_factory=threading.Event, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+
+    def wait_for_warm_model(self, timeout: float) -> None:
+        """Block only if a prompt-cache warm-up is currently running.
+
+        Ollama serves one request at a time, so issuing alongside the warm-up
+        means queueing behind it and probably exhausting our own HTTP timeout.
+        Waiting costs the same wall clock and then runs against a warm cache.
+        """
+        if self.llm_warm_started.is_set() and not self.llm_warm.is_set():
+            log.info("readiness: holding the LLM query until the prompt cache is warm")
+            self.llm_warm.wait(timeout=timeout)
 
     @property
     def ready(self) -> bool:
@@ -120,7 +137,7 @@ def wait_for_dependencies(state: Readiness = readiness) -> bool:
     while the model is still loading.
     """
     from db.connection import check_database_ready
-    from llm_query import check_model_ready
+    from llm_query import check_model_ready, warm_prompt_cache
 
     delay = INITIAL_DELAY
     log.info("readiness: waiting for the database and the model...")
@@ -133,6 +150,15 @@ def wait_for_dependencies(state: Readiness = readiness) -> bool:
             with state._lock:
                 state.state = "ready"
             log.info("readiness: everything is up — the chatbot is answering questions.")
+            # Ready FIRST, then warm. Template questions are already answerable
+            # and must not wait behind a minutes-long prefix pass on CPU.
+            state.llm_warm_started.set()
+            try:
+                warm_prompt_cache()
+            finally:
+                # Set even on failure: the LLM path should proceed and report a
+                # real error, not block forever on a warm-up that will not come.
+                state.llm_warm.set()
             return True
 
         log.info(
@@ -144,6 +170,7 @@ def wait_for_dependencies(state: Readiness = readiness) -> bool:
 
     with state._lock:
         state.state = "failed"
+    state.llm_warm.set()
     log.error("readiness: FAILED after %d attempts. Outstanding: %s",
               MAX_ATTEMPTS, state.waiting_for())
     return False

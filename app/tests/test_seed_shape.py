@@ -11,6 +11,7 @@ import yaml
 
 import seed_data
 from config import settings
+from db.dialect import get_dialect
 
 ANCHOR = date(2026, 8, 24)
 
@@ -178,3 +179,111 @@ def test_alarms_reference_real_batches_and_lines(data):
 def test_products_are_in_range(data):
     codes = {b[2] for b in data.batches}
     assert codes <= {f"PRD-{n}" for n in range(100, 106)}
+
+
+# --------------------------------------------------------------------------- #
+# Insertion
+# --------------------------------------------------------------------------- #
+
+class _FakeCursor:
+    """Captures the SQL the seeder would have executed."""
+
+    def __init__(self):
+        self.statements = []
+
+    def executemany(self, sql, rows):
+        self.statements.append(sql)
+
+
+def test_insert_uses_the_driver_placeholder_not_the_neutral_one():
+    """The seeder executes straight against the driver.
+
+    It never passes through sql_guard, so there is no to_driver_sql() step to
+    rewrite '?'. Emitting the authoring marker here is a syntax error that only
+    shows up at `docker compose up` time.
+    """
+    dialect = get_dialect()
+    cursor = _FakeCursor()
+    seed_data._insert(cursor, dialect, "lines", ["line_id", "line_name"], [(1, "Line A")])
+
+    sql = cursor.statements[0]
+    assert dialect.driver_placeholder in sql
+    if dialect.driver_placeholder != "?":
+        assert "?" not in sql, f"neutral marker leaked into a driver statement: {sql}"
+
+
+def test_insert_column_and_placeholder_counts_line_up():
+    dialect = get_dialect()
+    cursor = _FakeCursor()
+    columns = ["batch_id", "line_id", "product_code", "start_time",
+               "end_time", "status", "target_quantity"]
+    seed_data._insert(cursor, dialect, "batches", columns, [tuple(range(len(columns)))])
+    assert cursor.statements[0].count(dialect.driver_placeholder) == len(columns)
+
+
+def test_insert_skips_empty_row_sets():
+    cursor = _FakeCursor()
+    seed_data._insert(cursor, get_dialect(), "lines", ["line_id"], [])
+    assert cursor.statements == []
+
+
+# --------------------------------------------------------------------------- #
+# Configuration
+# --------------------------------------------------------------------------- #
+
+def _settings(monkeypatch, **env):
+    """A fresh Settings built from a controlled environment."""
+    import config
+    for key in ("POSTGRES_DB", "DB_HOST", "DB_PORT", "POSTGRES_ADMIN_USER",
+                "POSTGRES_ADMIN_PASSWORD", "APP_READONLY_USER",
+                "APP_READONLY_PASSWORD", "ADMIN_DATABASE_URL", "READONLY_DATABASE_URL"):
+        monkeypatch.delenv(key, raising=False)
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+    return config.Settings()
+
+
+def test_dsn_is_derived_from_the_discrete_variables(monkeypatch):
+    s = _settings(monkeypatch, POSTGRES_DB="mfg", DB_HOST="db",
+                  APP_READONLY_USER="readonly_user", APP_READONLY_PASSWORD="secret")
+    assert s.readonly_dsn == "postgresql://readonly_user:secret@db:5432/mfg"
+
+
+def test_dsn_percent_encodes_awkward_passwords(monkeypatch):
+    """An unencoded '@' would split the URL in the wrong place."""
+    s = _settings(monkeypatch, APP_READONLY_USER="readonly_user",
+                  APP_READONLY_PASSWORD="p@ss:w/rd")
+    assert "p%40ss%3Aw%2Frd" in s.readonly_dsn
+    assert s.readonly_dsn.endswith("@db:5432/mfg")
+
+
+def test_a_disagreeing_url_override_is_rejected_with_a_clear_message(monkeypatch):
+    """This is the 'password authentication failed' failure, caught early."""
+    s = _settings(
+        monkeypatch,
+        POSTGRES_ADMIN_USER="mfg_admin", POSTGRES_ADMIN_PASSWORD="admin-pw",
+        APP_READONLY_USER="readonly_user", APP_READONLY_PASSWORD="the-real-password",
+        READONLY_DATABASE_URL="postgresql://readonly_user:a-stale-password@db:5432/mfg",
+    )
+    with pytest.raises(RuntimeError) as excinfo:
+        s.require_db()
+    message = str(excinfo.value)
+    assert "READONLY_DATABASE_URL" in message
+    assert "APP_READONLY_PASSWORD" in message
+
+
+def test_an_agreeing_url_override_is_accepted(monkeypatch):
+    s = _settings(
+        monkeypatch,
+        POSTGRES_ADMIN_USER="mfg_admin", POSTGRES_ADMIN_PASSWORD="admin-pw",
+        APP_READONLY_USER="readonly_user", APP_READONLY_PASSWORD="pw",
+        READONLY_DATABASE_URL="postgresql://readonly_user:pw@db:5432/mfg",
+    )
+    s.require_db()
+
+
+def test_missing_credentials_are_named(monkeypatch):
+    s = _settings(monkeypatch, POSTGRES_ADMIN_USER="mfg_admin")
+    with pytest.raises(RuntimeError) as excinfo:
+        s.require_db()
+    assert "POSTGRES_ADMIN_PASSWORD" in str(excinfo.value)

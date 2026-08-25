@@ -212,6 +212,33 @@ def _clean(text: str) -> str:
 # Readiness
 # --------------------------------------------------------------------------- #
 
+def warm_prompt_cache(dialect: Dialect | None = None) -> float:
+    """Push the fixed prompt prefix through the model once, so it is cached.
+
+    Our prompt is a large constant prefix (rules + schema + few-shot examples)
+    followed by the question. Ollama caches the KV state of a prefix it has
+    already seen, and on CPU that prefix is where nearly all the time goes:
+    measured cold, a first question took 149 s; the next took 11 s.
+
+    So the readiness probe proving the model *responds* is not enough — it uses
+    a trivial prompt and leaves the real prefix cold, which hands the first
+    person to ask a question the entire 149 s. Doing it here, in the background
+    after readiness passes, means they get the 11 s instead.
+    """
+    prompt = build_prompt("warm up the prompt cache", dialect or get_dialect())
+    started = time.perf_counter()
+    try:
+        # num_predict=1: we want the prefix processed, not an answer.
+        _generate(prompt, timeout=float(settings.ollama_timeout), num_predict=1)
+    except LlmUnavailable as exc:
+        log.warning("prompt cache warm-up did not finish: %s", exc)
+        return 0.0
+    elapsed = time.perf_counter() - started
+    log.info("prompt cache warmed in %.1fs — LLM questions now skip prefix processing",
+             elapsed)
+    return elapsed
+
+
 def check_model_ready() -> tuple[bool, str]:
     """Prove the model ANSWERS, not merely that the port is open.
 
@@ -242,4 +269,4 @@ def check_model_ready() -> tuple[bool, str]:
 
 
 __all__ = ["generate_sql", "build_prompt", "load_examples", "check_model_ready",
-           "LlmSql", "LlmUnavailable"]
+           "warm_prompt_cache", "LlmSql", "LlmUnavailable"]

@@ -33,8 +33,10 @@ import llm_query
 import responder
 import sql_guard
 import templates
+from config import settings
 from db.connection import QueryExecutionError, run_select
 from db.dialect import get_dialect
+from readiness import readiness
 
 log = logging.getLogger(__name__)
 
@@ -111,6 +113,7 @@ def answer_question(question: str, now: datetime | None = None) -> Answer:
         # ---- route 2: local LLM ------------------------------------------
         route = "llm"
         log.info("no template matched, falling back to the model")
+        readiness.wait_for_warm_model(timeout=float(settings.ollama_timeout))
         try:
             produced = llm_query.generate_sql(question, dialect)
         except llm_query.LlmUnavailable as exc:
@@ -129,6 +132,18 @@ def answer_question(question: str, now: datetime | None = None) -> Answer:
                 model=model_name, answer=REJECTION_MESSAGE,
                 detail="The model returned an empty response instead of a SELECT statement.",
             ), started)
+
+    # The prompt tells the model to emit this sentinel when the schema cannot
+    # answer the question. That is a correct refusal, not a safety violation —
+    # reporting it as "failed validation" blames the wrong thing.
+    if route == "llm" and "cannot answer" in candidate_sql.lower():
+        return _finish(Answer(
+            ok=False, question=question, route="rejected", llm_ms=llm_ms,
+            model=model_name, sql=candidate_sql,
+            answer="I can't answer that from this data. I only have production "
+                   "batches, part counts and alarms for the three lines.",
+            detail="The model reported that the question cannot be answered from this schema.",
+        ), started)
 
     # ---- the guard: both routes, no exceptions ---------------------------
     try:

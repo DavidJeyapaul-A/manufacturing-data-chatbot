@@ -382,9 +382,16 @@ def _batches_are_empty(cur, dialect: Dialect) -> bool:
 
 
 def _insert(cur, dialect: Dialect, table: str, columns: list[str], rows: list[tuple]) -> None:
+    """Bulk INSERT via the driver.
+
+    Uses `driver_placeholder`, NOT `placeholder`: this statement is executed
+    straight against the driver and never passes through sql_guard, so there is
+    no to_driver_sql() step to rewrite the neutral '?' that the templates author
+    with. psycopg wants '%s'; pyodbc wants '?'.
+    """
     if not rows:
         return
-    marks = ", ".join([dialect.placeholder] * len(columns))
+    marks = ", ".join([dialect.driver_placeholder] * len(columns))
     cols = ", ".join(dialect.quote_identifier(c) for c in columns)
     sql = f"INSERT INTO {dialect.quote_identifier(table)} ({cols}) VALUES ({marks})"
     cur.executemany(sql, rows)
@@ -428,11 +435,44 @@ def main() -> int:
                 log.info("batches already has rows — skipping data generation "
                          "(this is the idempotent path).")
 
-            # 3. grants, ALWAYS — a re-run repairs a missing GRANT.
-            readonly_user = settings.readonly_dsn.split("://", 1)[-1].split(":", 1)[0]
-            for statement in dialect.grant_readonly_statements(readonly_user, TABLES):
-                cur.execute(statement)
+            # 3. the readonly role, ALWAYS.
+            #
+            # db/init/ creates it, but Postgres runs init scripts only against an
+            # EMPTY data volume. On a volume that already existed the role would
+            # never appear, and `docker compose up` would fail on a fresh clone
+            # for a reason that has nothing to do with the clone. Doing it here
+            # too — idempotently, with admin rights, on every bring-up — makes
+            # the stack self-healing and keeps the password in step with .env.
+            readonly_user = settings.readonly_user
+            existed = dialect.ensure_readonly_role(
+                conn, readonly_user, settings.readonly_password, settings.db_name
+            )
             conn.commit()
+            log.info("readonly role '%s' %s", readonly_user,
+                     "verified (password re-applied from .env)" if existed else "CREATED")
+
+            # 4. grants, ALWAYS — a re-run repairs a missing GRANT.
+            try:
+                for statement in dialect.grant_readonly_statements(readonly_user, TABLES):
+                    cur.execute(statement)
+                conn.commit()
+            except Exception as exc:
+                conn.rollback()
+                raise RuntimeError(
+                    f"could not grant SELECT to '{readonly_user}': {exc}\n"
+                    f"\n"
+                    f"The role itself was created or verified a moment earlier, so this\n"
+                    f"is most likely a permissions problem with the ADMIN role: it must\n"
+                    f"own the tables it is granting on. Check POSTGRES_ADMIN_USER in\n"
+                    f".env against the owner reported by:\n"
+                    f"\n"
+                    f"    docker compose exec db psql -U {settings.admin_user} "
+                    f"-d {settings.db_name} -c '\\dt'\n"
+                    f"\n"
+                    f"Starting clean also resolves it (database only — note that\n"
+                    f"`down -v` would also delete the model volume):\n"
+                    f"    docker compose down && docker volume rm mfg_pgdata"
+                ) from exc
             log.info("granted SELECT on %s to '%s'", ", ".join(TABLES), readonly_user)
 
     return 0

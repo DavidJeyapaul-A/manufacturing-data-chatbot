@@ -6,6 +6,7 @@ import os
 from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
+from urllib.parse import quote, unquote, urlsplit
 
 APP_DIR = Path(__file__).resolve().parent
 
@@ -33,9 +34,44 @@ class Settings:
     ollama_timeout: int = field(default_factory=lambda: _int("OLLAMA_TIMEOUT", 180))
 
     # --- Database ---------------------------------------------------------
+    # The DSNs are DERIVED from these discrete parts, which are the very same
+    # variables the db container uses to create the roles. Writing the password
+    # once means the credential the app presents and the credential the role was
+    # created with cannot drift apart — a mismatch shows up as an opaque
+    # "password authentication failed", which is a miserable thing to debug.
     dialect_name: str = field(default_factory=lambda: _str("DB_DIALECT", "postgres"))
-    admin_dsn: str = field(default_factory=lambda: _str("ADMIN_DATABASE_URL"))
-    readonly_dsn: str = field(default_factory=lambda: _str("READONLY_DATABASE_URL"))
+    db_name: str = field(default_factory=lambda: _str("POSTGRES_DB", "mfg"))
+    db_host: str = field(default_factory=lambda: _str("DB_HOST", "db"))
+    db_port: int = field(default_factory=lambda: _int("DB_PORT", 5432))
+
+    admin_user: str = field(default_factory=lambda: _str("POSTGRES_ADMIN_USER", "mfg_admin"))
+    admin_password: str = field(default_factory=lambda: _str("POSTGRES_ADMIN_PASSWORD"))
+    readonly_user: str = field(default_factory=lambda: _str("APP_READONLY_USER", "readonly_user"))
+    readonly_password: str = field(default_factory=lambda: _str("APP_READONLY_PASSWORD"))
+
+    #: Optional escape hatches, for pointing at a database this compose file did
+    #: not create. Leave blank and the DSN is built from the parts above.
+    admin_url_override: str = field(default_factory=lambda: _str("ADMIN_DATABASE_URL"))
+    readonly_url_override: str = field(default_factory=lambda: _str("READONLY_DATABASE_URL"))
+
+    def _dsn(self, user: str, password: str) -> str:
+        """Build a DSN, percent-encoding the credentials.
+
+        Without the encoding a password containing '@', ':' or '/' produces a
+        URL that parses into the wrong pieces and fails to authenticate.
+        """
+        return (
+            f"postgresql://{quote(user, safe='')}:{quote(password, safe='')}"
+            f"@{self.db_host}:{self.db_port}/{self.db_name}"
+        )
+
+    @property
+    def admin_dsn(self) -> str:
+        return self.admin_url_override or self._dsn(self.admin_user, self.admin_password)
+
+    @property
+    def readonly_dsn(self) -> str:
+        return self.readonly_url_override or self._dsn(self.readonly_user, self.readonly_password)
 
     # --- Guardrails -------------------------------------------------------
     max_rows: int = field(default_factory=lambda: _int("MAX_ROWS", 200))
@@ -63,11 +99,14 @@ class Settings:
         return date.today()
 
     def require_db(self) -> None:
+        """Fail early and specifically, rather than at connect time."""
         missing = [
             name
             for name, value in (
-                ("ADMIN_DATABASE_URL", self.admin_dsn),
-                ("READONLY_DATABASE_URL", self.readonly_dsn),
+                ("POSTGRES_ADMIN_USER", self.admin_user),
+                ("POSTGRES_ADMIN_PASSWORD", self.admin_password),
+                ("APP_READONLY_USER", self.readonly_user),
+                ("APP_READONLY_PASSWORD", self.readonly_password),
             )
             if not value
         ]
@@ -75,6 +114,49 @@ class Settings:
             raise RuntimeError(
                 f"Missing required environment variable(s): {', '.join(missing)}. "
                 "Did you copy .env.example to .env?"
+            )
+        self._check_override_agrees(
+            "ADMIN_DATABASE_URL", self.admin_url_override,
+            "POSTGRES_ADMIN_USER", self.admin_user,
+            "POSTGRES_ADMIN_PASSWORD", self.admin_password,
+        )
+        self._check_override_agrees(
+            "READONLY_DATABASE_URL", self.readonly_url_override,
+            "APP_READONLY_USER", self.readonly_user,
+            "APP_READONLY_PASSWORD", self.readonly_password,
+        )
+
+    @staticmethod
+    def _check_override_agrees(
+        url_var: str, url: str,
+        user_var: str, user: str,
+        password_var: str, password: str,
+    ) -> None:
+        """A URL override that disagrees with the discrete vars is always a bug.
+
+        The db container creates the role from the DISCRETE variables, so if the
+        override carries a different credential the app authenticates with one
+        password against a role created with another. Say so plainly instead of
+        letting Postgres report 'password authentication failed'.
+        """
+        if not url:
+            return
+        parts = urlsplit(url)
+        url_user = unquote(parts.username or "")
+        url_password = unquote(parts.password or "")
+        problems = []
+        if url_user != user:
+            problems.append(f"user {url_user!r} but {user_var}={user!r}")
+        if url_password != password:
+            problems.append(f"a different password than {password_var}")
+        if problems:
+            raise RuntimeError(
+                f"{url_var} disagrees with the discrete database variables: "
+                + "; ".join(problems)
+                + f". The database roles are created from {user_var}/{password_var}, "
+                f"so this mismatch would fail authentication. Either delete {url_var} "
+                f"from .env (it is optional — the DSN is built from the parts) or "
+                f"make it match."
             )
 
 

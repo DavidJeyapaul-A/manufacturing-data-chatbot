@@ -119,5 +119,34 @@ def check_database_ready(dialect: Dialect | None = None) -> tuple[bool, str]:
                 if table == "batches" and not count:
                     return False, "the batches table is empty — has the seed step run?"
     except Exception as exc:
-        return False, f"{type(exc).__name__}: {str(exc).strip()}"
+        return False, _explain_db_error(exc)
     return True, "database reachable and seeded"
+
+
+def _explain_db_error(exc: Exception) -> str:
+    """Attach a remedy to the failures that have a known, specific cause.
+
+    A raw driver error in the UI banner tells the user what broke but not what
+    to do. These two account for nearly every failed first bring-up.
+    """
+    detail = f"{type(exc).__name__}: {str(exc).strip()}"
+    text = str(exc).lower()
+
+    if "password authentication failed" in text:
+        return (
+            f"{detail} — the password stored on the role differs from "
+            f"APP_READONLY_PASSWORD. The roles are created ONLY against an empty "
+            f"data volume, so a later .env change does not reach them. Fix the "
+            f"existing role in place: docker compose exec db psql -U "
+            f"{settings.admin_user} -d {settings.db_name} -c \"ALTER ROLE "
+            f"{settings.readonly_user} WITH PASSWORD '<the password in .env>';\" "
+            f"— or reset just the database with: docker compose down && "
+            f"docker volume rm mfg_pgdata"
+        )
+    if "does not exist" in text and "role" in text:
+        return (
+            f"{detail} — the database init script never took effect on this "
+            f"volume. Reset just the database with: docker compose down && "
+            f"docker volume rm mfg_pgdata && docker compose up"
+        )
+    return detail
